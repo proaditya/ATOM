@@ -2626,6 +2626,12 @@ class ModelRunner:
     @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
         shrunk_q = self._dspark_apply_q_bucket(batch)
+        if shrunk_q is None and self._verify_len_policy():
+            from atom.spec_decode.verify_len import apply_verify_len
+
+            shrunk_q = apply_verify_len(
+                batch, self._verify_len_policy(), self.drafter.mtp_k
+            )
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
@@ -3746,15 +3752,40 @@ class ModelRunner:
                     getter,
                 )
 
+    def _verify_len_policy(self) -> tuple:
+        """``ATOM_SPEC_VERIFY_LEN``'s verify widths by batch size, parsed once;
+        empty without a drafter, or when DSpark's confidence schedule sizes
+        the steps instead."""
+        policy = getattr(self, "_verify_len_policy_cache", None)
+        if policy is None:
+            policy = ()
+            drafter = getattr(self, "drafter", None)
+            if drafter is not None and not drafter.uses_confidence_schedule:
+                from atom.spec_decode.verify_len import parse_policy
+
+                policy = parse_policy(envs.ATOM_SPEC_VERIFY_LEN, drafter.mtp_k)
+                if policy:
+                    logger.info(
+                        "Speculative verify drafts by batch size: %s", dict(policy)
+                    )
+            self._verify_len_policy_cache = policy
+        return policy
+
     def _dspark_capture_q_buckets(self, full_q: int) -> list[int]:
-        """DSpark query-length buckets to capture graphs for (paper Phase 2).
+        """Query-length buckets to capture graphs for: DSpark's (paper Phase 2),
+        or the verify widths of ``ATOM_SPEC_VERIFY_LEN``.
 
         Confidence scheduling replays a SMALLER max_q_len than full_q, so we
         capture one rectangular graph set per bucket. RAGGED and the older
         q-bucket path use independent size sets. Defaults to ``[full_q]`` (the
-        Phase-1 single-graph behavior) when confidence scheduling is off.
+        Phase-1 single-graph behavior) when neither shrinks steps.
         """
         if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
+            policy = self._verify_len_policy()
+            if policy:
+                from atom.spec_decode.verify_len import q_buckets
+
+                return q_buckets(policy, full_q - 1)
             return [full_q]
         from atom.spec_decode.dspark_scheduler import resolve_q_buckets
 

@@ -385,6 +385,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path supports is ever routed to it; every other batch keeps the original
     # model. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # Drafts a speculative decode step verifies, by batch size
+    # (atom/spec_decode/verify_len.py): "BS:DRAFTS,...", the entry with the
+    # largest BS <= the batch applying, e.g. "1:7,24:3,48:2". Unset: every step
+    # verifies all num_speculative_tokens.
+    "ATOM_SPEC_VERIFY_LEN": lambda: os.getenv("ATOM_SPEC_VERIFY_LEN", ""),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

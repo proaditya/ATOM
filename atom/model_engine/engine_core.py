@@ -50,6 +50,10 @@ logger = logging.getLogger("atom")
 # idle token-poll timeout and is far below any transfer latency.
 KV_IDLE_DRAIN_INTERVAL_S = 0.001
 
+# How long an idle busy loop sleeps per spin: long enough for the IO threads
+# to take the GIL, short against any request's latency.
+IDLE_YIELD_S = 0.0001
+
 # Upper bound on the drain that runs after the loop exits. A peer that died
 # mid-transfer leaves a completion that never arrives; exiting late beats
 # never exiting.
@@ -394,6 +398,12 @@ class EngineCore:
                     self._process_engine_step()
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
+                else:
+                    # Idle: hand the GIL to the IO threads. A spinning loop
+                    # keeps it, so the output thread would send a finished
+                    # request (and the input thread take a new one) only at
+                    # the next interpreter switch, 5 ms later by default.
+                    time.sleep(IDLE_YIELD_S)
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup

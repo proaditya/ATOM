@@ -1179,12 +1179,27 @@ class GDNStateMixin(PoolRowsMixin):
                     non_spec_state_indices[idx] = committed
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
-
-        if self.model_runner.tokenID_processor.num_bonus is None:
-            return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        # Staged on the host and copied once, asynchronously: an element-wise
+        # write into the device tensor is a synchronous copy per request, which
+        # waits for the stream (the previous step's draft) every step. A ring
+        # of pinned buffers, so a copy still queued is never overwritten.
+        ring = getattr(self, "_accepted_ring", None)
+        if ring is None:
+            n = self.num_accepted_tokens.shape[0]
+            dtype = self.num_accepted_tokens.dtype
+            ring = self._accepted_ring = [
+                torch.ones(n, dtype=dtype, pin_memory=True) for _ in range(4)
+            ]
+            self._accepted_ring_i = 0
+        self._accepted_ring_i = (self._accepted_ring_i + 1) % len(ring)
+        host = ring[self._accepted_ring_i]
+        host.fill_(1)
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        if num_bonus is not None and len(num_bonus):
+            host[: len(num_bonus)] = (
+                torch.from_numpy(np.asarray(num_bonus)).to(host.dtype) + 1
+            )
+        self.num_accepted_tokens.copy_(host, non_blocking=True)
 
     def prepare_gdn_metadata(
         self,
@@ -1416,23 +1431,35 @@ class GDNStateMixin(PoolRowsMixin):
 
         attn_metadata.gdn_metadata = gdn_metadata
 
-    def _build_gdn_capture_metadata(self, bs: int):
+    def _build_gdn_capture_metadata(self, bs: int, q: int | None = None):
         if self.use_spec_decode:
+            # a graph of q rows a request (a narrower verify,
+            # ``ATOM_SPEC_VERIFY_LEN``); replays overwrite the start offsets
+            q = self.num_spec + 1 if q is None else q
+            self.spec_query_start_loc[: bs + 1].copy_(
+                torch.arange(
+                    0,
+                    (bs + 1) * q,
+                    q,
+                    dtype=self.spec_query_start_loc.dtype,
+                    device=self.device,
+                )
+            )
             gdn_metadata = GDNAttentionMetadata(
                 num_prefills=0,
                 num_prefill_tokens=0,
                 num_decodes=0,
                 num_decode_tokens=0,
                 num_spec_decodes=bs,
-                num_spec_decode_tokens=bs * (self.num_spec + 1),
-                num_actual_tokens=bs * (self.num_spec + 1),
+                num_spec_decode_tokens=bs * q,
+                num_actual_tokens=bs * q,
                 has_initial_state=None,
                 spec_query_start_loc=self.spec_query_start_loc[: bs + 1],
                 non_spec_query_start_loc=None,
                 spec_state_indices_tensor=self.spec_state_indices_tensor.gpu[:bs],
                 non_spec_state_indices_tensor=None,
                 spec_sequence_masks=self.spec_sequence_masks[:bs],
-                spec_token_indx=self.spec_token_indx[: bs * (self.num_spec + 1)],
+                spec_token_indx=self.spec_token_indx[: bs * q],
                 non_spec_token_indx=self.non_spec_token_indx[:0],
                 num_accepted_tokens=self.num_accepted_tokens[:bs],
                 nums_dict=None,
@@ -1634,8 +1661,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
         return result
 
-    def build_for_cudagraph_capture(self, bs: int):
+    def build_for_cudagraph_capture(self, bs: int, max_q_len: int | None = None):
         var = self.model_runner.forward_vars
+        q = int(var["max_qlen"]) if max_q_len is None else int(max_q_len)
         if self.block_size == 1024:
             ctx_pa_ps = self.set_aiter_persistent_worker_buffers(bs)
         else:
@@ -1644,7 +1672,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             slot_mapping=var["slot_mapping"].gpu[:bs],
             context_lens=var["context_lens"].gpu[:bs],
             block_tables=var["block_tables"].gpu[:bs],
-            max_seqlen_q=var["max_qlen"],
+            max_seqlen_q=q,
             cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu[:],
@@ -1652,7 +1680,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             **ctx_pa_ps,
         )
 
-        attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
+        attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(
+            bs, q if self.use_spec_decode else None
+        )
 
         # Decode replays this graph, so the op must see a plan HERE: absent at
         # capture time, the static path is what gets recorded and every later
@@ -1664,7 +1694,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         # A capture runs a full synthetic batch, so nothing is padded and the
         # scheduled shape is the running one.
-        capture_tokens = bs * int(var["max_qlen"])
+        capture_tokens = bs * q
         positions = var["positions"].copy_to_gpu(capture_tokens)
         context = Context(
             positions=positions,
