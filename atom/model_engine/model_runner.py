@@ -897,6 +897,10 @@ class ModelRunner:
                 getattr(self, "drafter", None),
                 self.attn_metadata_builder,
             )
+        if envs.ATOM_SPEC_TREE and getattr(self, "drafter", None) is not None:
+            from atom.spec_decode.tree_verify import install_tree_verify
+
+            install_tree_verify(self, envs.ATOM_SPEC_TREE)
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -3763,7 +3767,19 @@ class ModelRunner:
             if drafter is not None and not drafter.uses_confidence_schedule:
                 from atom.spec_decode.verify_len import parse_policy
 
-                policy = parse_policy(envs.ATOM_SPEC_VERIFY_LEN, drafter.mtp_k)
+                spec = envs.ATOM_SPEC_VERIFY_LEN
+                if envs.ATOM_SPEC_TREE:
+                    # a tree verify's width is its tree's nodes: a batch
+                    # policy's, else every node
+                    from atom.spec_decode.tree_verify import parse_dynamic_policy
+
+                    trees = parse_dynamic_policy(envs.ATOM_SPEC_TREE)
+                    spec = (
+                        ",".join(f"{b}:{d[2] - 1}" for b, d in trees)
+                        if len(trees) > 1
+                        else ""
+                    )
+                policy = parse_policy(spec, drafter.mtp_k)
                 if policy:
                     logger.info(
                         "Speculative verify drafts by batch size: %s", dict(policy)

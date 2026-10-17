@@ -130,6 +130,7 @@ support_draft_model_arch_dict = {
     "Glm5NextMTPModel": "atom.models.glm5_next_mtp.Glm5NextMTP",
     "Qwen4ExpMTPModel": "atom.models.qwen4_exp_mtp.Qwen4ExpMTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
+    "Eagle4LlamaModel": "atom.models.eagle4_llama.Eagle4LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
 }
@@ -429,6 +430,12 @@ class Drafter(abc.ABC):
             # rows with noise-token embeddings.
             if ctx.is_draft:
                 return
+            if getattr(module, "output_partial", False):
+                # the layer's output is still a TP partial sum (its all-reduce
+                # is fused into the next layer's norm): sum it here
+                from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+
+                output = (tensor_model_parallel_all_reduce(output[0]), *output[1:])
             tensor = extract(output, module)
             if tensor is None:
                 return

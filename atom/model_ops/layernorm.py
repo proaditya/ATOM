@@ -767,6 +767,9 @@ class GemmaRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.use_fused_quant = False
         self.write_bf16 = write_bf16
+        # The input is a row-parallel projection's partial sums: all-reduce it
+        # in the norm's kernel (TP > 1, with a residual to add it to).
+        self.fused_allreduce = False
         if quant_config is not None:
             from aiter import QuantType
 
@@ -896,6 +899,14 @@ class GemmaRMSNorm(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.use_fused_quant:
             return self._forward_fused_fp8(x, residual)
+        if self.fused_allreduce and residual is not None:
+            return tensor_model_parallel_fused_allreduce_rmsnorm(
+                x.contiguous(),
+                residual,
+                self.weight,
+                self.variance_epsilon,
+                gemma_norm=True,
+            )
         return self.forward_cuda(x, residual)
 
 

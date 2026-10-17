@@ -157,6 +157,53 @@ class GatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    def _tree_verify(
+        self,
+        tree,
+        mixed_qkv,
+        b,
+        a,
+        core_attn_out,
+        layer_cache,
+        gdn_metadata,
+        conv_weights,
+    ):
+        """A tree verify (``spec_decode.tree_verify``): every node from its
+        parent, the request's state untouched; each node's replay record and
+        pre-conv input kept for the commit."""
+        from atom.model_ops import gdn_tree
+
+        bs = gdn_metadata.num_spec_decodes
+        n = tree.n_step  # this step's verify width (a batch policy's)
+        t = bs * n
+        li = tree.gdn_index[self.layer_num]
+        # column 0 of the [bs, slots] table: a strided view, the kernels index it densely
+        slots = gdn_metadata.spec_state_indices_tensor[:bs, 0].contiguous()
+        conv = gdn_tree.tree_conv(
+            mixed_qkv[:t], layer_cache.k_cache, slots, None, tree.parents, conv_weights,
+            self.conv1d.bias, self.activation, raw=tree.raw[li, :bs, :n],
+        )  # fmt: skip
+        # q / k / v as views of the conv output (rearrange_mixed_qkv's split, no copies)
+        kd, vd = self.key_dim // self.tp_size, self.value_dim // self.tp_size
+        query = conv[:, :kd].view(t, -1, self.head_k_dim)
+        key = conv[:, kd : 2 * kd].view(t, -1, self.head_k_dim)
+        value = conv[:, 2 * kd : 2 * kd + vd].view(t, -1, self.head_v_dim)
+        out = core_attn_out[:t].view(t, -1, self.head_v_dim)
+        args = (
+            query, key, value, a[:t], b[:t], self.A_log, self.dt_bias,
+            layer_cache.v_cache, slots, tree.parents, tree.records[li], out,
+        )  # fmt: skip
+        if gdn_tree.flydsl_chunk_ok(layer_cache.v_cache, n):
+            # the one-kernel FlyDSL chunk of SGLang's EAGLE-4 ROCm port (bf16 pool)
+            from atom.model_ops.gdn_tree_flydsl import tree_chunk_flydsl
+
+            tree_chunk_flydsl(*args, cu=tree.cu_rows[: bs + 1], rows=tree.req_rows[:bs])
+        else:
+            gdn_tree.tree_gated_delta_rule(*args)
+        if t < core_attn_out.shape[0]:
+            core_attn_out[t:].zero_()
+        return core_attn_out
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -214,6 +261,24 @@ class GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+
+        tree = getattr(self, "tree", None)
+        if (
+            tree is not None
+            and spec_sequence_masks is not None
+            and gdn_metadata.num_prefills == 0
+            and gdn_metadata.num_decodes == 0
+        ):
+            return self._tree_verify(
+                tree,
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                layer_cache,
+                gdn_metadata,
+                conv_weights,
+            )
 
         if spec_sequence_masks is not None:
             if gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0:

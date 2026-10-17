@@ -1170,6 +1170,7 @@ class ParallelConfig:
 
 _SERIAL_MTP_DEFAULT_MAX_SPEC = 8
 _EAGLE3_DEFAULT_MAX_SPEC = 4
+_EAGLE4_DEFAULT_MAX_SPEC = 15
 _SEQUENTIAL_DRAFTER_MAX_SPEC_ATTRS = (
     "max_speculative_tokens",
     "max_num_speculative_tokens",
@@ -1189,6 +1190,9 @@ def _resolve_sequential_drafter_max_spec(
         if max_spec is not None:
             return int(max_spec)
 
+    if (getattr(draft_cfg, "architectures", None) or [""])[0] == "Eagle4LlamaModel":
+        # EAGLE-4 drafts are trained for chains of any depth
+        return _EAGLE4_DEFAULT_MAX_SPEC
     if speculative_config.method == "eagle3":
         return _EAGLE3_DEFAULT_MAX_SPEC
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
@@ -1468,6 +1472,8 @@ class SpeculativeConfig:
             return
         if arch == "LlamaForCausalLMEagle3":
             hf_config.architectures = ["Eagle3LlamaModel"]
+        elif arch == "LlamaForCausalLMEagle4":
+            hf_config.architectures = ["Eagle4LlamaModel"]
         elif arch == "Eagle3DeepseekV2ForCausalLM":
             hf_config.architectures = ["Eagle3DeepseekMLAModel"]
 
@@ -2711,6 +2717,12 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # Tree speculation adds each verify row's depth to its RoPE position
+        # (qwen3_next ``tree_rope_delta``), and the all-reduce + RMSNorm fusion
+        # leaves Qwen3.5 layer outputs partial (qwen3_5 ``output_partial``):
+        # both change the traced graph.
+        factors.append(envs.ATOM_SPEC_TREE)
+        factors.append(bool(envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

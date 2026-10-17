@@ -385,11 +385,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path supports is ever routed to it; every other batch keeps the original
     # model. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # EAGLE-4 drafts its whole round as one CUDA graph of fused kernels
+    # (atom/spec_decode/eagle4_fast.py) instead of EagleProposer's loop. 0
+    # disables it.
+    "ATOM_EAGLE4_FAST_DRAFT": lambda: os.getenv("ATOM_EAGLE4_FAST_DRAFT", "1") == "1",
+    # The fused EAGLE-4 round's projections in MXFP4 (weights re-quantized,
+    # MXFP8 activations, scaled MFMA) instead of bf16: about twice as fast a
+    # draft step; the drafted tokens can differ, the output cannot.
+    "ATOM_EAGLE4_DRAFT_MXFP4": lambda: os.getenv("ATOM_EAGLE4_DRAFT_MXFP4", "0") == "1",
     # Drafts a speculative decode step verifies, by batch size
     # (atom/spec_decode/verify_len.py): "BS:DRAFTS,...", the entry with the
     # largest BS <= the batch applying, e.g. "1:7,24:3,48:2". Unset: every step
     # verifies all num_speculative_tokens.
     "ATOM_SPEC_VERIFY_LEN": lambda: os.getenv("ATOM_SPEC_VERIFY_LEN", ""),
+    # Tree speculation (atom/spec_decode/tree_verify.py): "dyn:STEPS:WIDTH:NODES"
+    # verifies the draft's EAGLE-2 dynamic tree (a WIDTH beam STEPS deep, the
+    # best NODES - 1 nodes; --num-speculative-tokens NODES - 1), or a tree a
+    # batch size, "1=dyn:...,B=dyn:..." (from B requests on). Unset: chains.
+    "ATOM_SPEC_TREE": lambda: os.getenv("ATOM_SPEC_TREE", ""),
+    # Tree verify's GDN chunk on the FlyDSL kernel of SGLang's EAGLE-4 ROCm port
+    # (atom/model_ops/gdn_tree_flydsl.py; 0: the Triton chunk).
+    "ATOM_GDN_TREE_FLYDSL": lambda: os.getenv("ATOM_GDN_TREE_FLYDSL", "1") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

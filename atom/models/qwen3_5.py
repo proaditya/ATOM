@@ -6,6 +6,7 @@ from torch import nn
 from atom.config import QuantizationConfig, Config
 
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -416,6 +417,25 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 )
             )
+        # TP > 1, dense: the row-parallel projections hand on partial sums and
+        # the norm after each adds them in its all-reduce kernel. A layer's
+        # output is then a partial sum (``output_partial``) until the next
+        # norm; aux-capture hooks all-reduce it themselves.
+        self.output_partial = (
+            config.model_type == "qwen3_5_text"
+            and atom_config.tensor_parallel_size > 1
+            and envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
+        )
+        if self.output_partial:
+            mixer = (
+                self.linear_attn.out_proj
+                if self.layer_type == "linear_attention"
+                else self.self_attn.o_proj
+            )
+            for proj in (mixer, self.mlp.down_proj):
+                proj.reduce_results = False
+            self.input_layernorm.fused_allreduce = True
+            self.post_attention_layernorm.fused_allreduce = True
 
 
 @support_torch_compile(
@@ -460,6 +480,10 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # the last layer's output is a partial sum under the fused all-reduce
+        self.norm.fused_allreduce = any(
+            getattr(layer, "output_partial", False) for layer in self.layers
+        )
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {

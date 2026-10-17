@@ -209,9 +209,16 @@ class GDNStateMixin(PoolRowsMixin):
         # itself when there are drafts to roll back, and does not when there
         # are none.  `ATOM_ENABLE_REPLAYSSM` overrides in either direction.
         replayssm_override = envs.ATOM_ENABLE_REPLAYSSM
+        # a tree verify (spec_decode.tree_verify) keeps one state slot a
+        # request and commits the accepted path into it itself
+        self.tree_mode = self.use_spec_decode and bool(envs.ATOM_SPEC_TREE)
         self.replayssm = (
-            self.use_spec_decode if replayssm_override is None else replayssm_override
+            self.use_spec_decode and not self.tree_mode
+            if replayssm_override is None
+            else replayssm_override
         )
+        if self.tree_mode and self.replayssm:
+            raise ValueError("ATOM_SPEC_TREE does not run with ATOM_ENABLE_REPLAYSSM=1")
         self.replayssm_max_query_len = self.num_spec + 1
         self.replayssm_route = envs.ATOM_REPLAYSSM_ROUTE
         self.replayssm_cache_len = 0
@@ -395,6 +402,13 @@ class GDNStateMixin(PoolRowsMixin):
                     f"{sorted(_GDN_SSM_DTYPES)}."
                 )
             return (self.model_runner.config.torch_dtype, temporal_dtype)
+        if self.tree_mode:
+            # a tree verify keeps the model dtype (as SGLang's tree verify: the
+            # replay records and their commit stay fp32), VK in memory below
+            return (
+                self.model_runner.config.torch_dtype,
+                self.model_runner.config.torch_dtype,
+            )
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -545,7 +559,7 @@ class GDNStateMixin(PoolRowsMixin):
         `causal_conv1d_update` only ever addresses column 0, because it rolls
         the conv window back in place via `num_accepted_tokens`.)
         """
-        return 1 if self.replayssm else 1 + self.num_spec
+        return 1 if self.replayssm or self.tree_mode else 1 + self.num_spec
 
     def allocate_per_req_cache(
         self, entries: dict[str, int]
@@ -559,13 +573,17 @@ class GDNStateMixin(PoolRowsMixin):
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.num_state_layers()
+        ssm = torch.zeros((n, num_slots) + shape_v, dtype=dt_v, device="cuda")
+        if self.tree_mode:
+            # The tree kernels keep the state [head][v][k], k contiguous: the
+            # "VK" layout the recurrent kernels take as a transposed view
+            # (`INIT_STATE_VK`, picked from `stride(-2) == 1`).
+            ssm = ssm.transpose(-1, -2)
         tensors = {
             "mamba_k_cache": torch.zeros(
                 (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
             ),
-            "mamba_v_cache": torch.zeros(
-                (n, num_slots) + shape_v, dtype=dt_v, device="cuda"
-            ),
+            "mamba_v_cache": ssm,
         }
         shapes = self._replayssm_buffer_shapes()
         if shapes is not None:

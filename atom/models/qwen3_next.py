@@ -406,6 +406,7 @@ class Qwen3NextAttention(nn.Module):
             and self.attn_output_gate
             and self.o_proj.quant_type == QuantType.per_1x128
         )
+        self.tree_rope_delta = None  # spec_decode.tree_verify sets it
 
     def forward(
         self,
@@ -414,6 +415,10 @@ class Qwen3NextAttention(nn.Module):
         x_scale=None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
+        if self.tree_rope_delta is not None:
+            # a tree verify's rows are RoPE'd at the context end + their depth
+            # (spec_decode.tree_verify; zero on every other forward)
+            positions = positions + self.tree_rope_delta[: positions.shape[-1]]
 
         if self.attn_output_gate:
             gate, qkv = torch.split(

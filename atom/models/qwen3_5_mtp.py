@@ -65,6 +65,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         )
 
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # a layer's output is a partial sum under the fused TP all-reduce
+        self.norm.fused_allreduce = any(
+            getattr(layer, "output_partial", False) for layer in self.layers
+        )
         self.pre_fc_norm_hidden = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
