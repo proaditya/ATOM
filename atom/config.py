@@ -1189,6 +1189,9 @@ def _resolve_sequential_drafter_max_spec(
         if max_spec is not None:
             return int(max_spec)
 
+    if (getattr(draft_cfg, "architectures", None) or [""])[0] == "DFlash2DraftModel":
+        # one block pass drafts block - 1 tokens
+        return int(draft_cfg.dflash_config["block_size"]) - 1
     if speculative_config.method == "eagle3":
         return _EAGLE3_DEFAULT_MAX_SPEC
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
@@ -1463,6 +1466,9 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        if arch == "DFlash2DraftModel":
+            # a standalone block draft (model_type qwen3): no MTP rewrite
+            return
         if arch.endswith("DSparkModel"):
             _normalize_draft_dspark_config(hf_config)
             return

@@ -415,7 +415,7 @@ class EngineArgs:
             "--method",
             type=str,
             default=None,
-            choices=["mtp", "eagle3", "dspark"],
+            choices=["mtp", "eagle3", "dspark", "dflash"],
             help="Speculative method",
         )
         parser.add_argument(
@@ -778,8 +778,8 @@ class EngineArgs:
             draft_model = kwargs.pop("draft_model")
             synthetic_acceptance_rate = kwargs.pop("spec_decode_acceptance_rate")
             synthetic_acceptance_length = kwargs.pop("spec_decode_acceptance_length")
-            if method == "eagle3" and not draft_model:
-                raise ValueError("--draft-model is required when --method eagle3.")
+            if method in ("eagle3", "dflash") and not draft_model:
+                raise ValueError(f"--draft-model is required when --method {method}.")
             if draft_model and method == "mtp":
                 raise ValueError(
                     "--draft-model is not supported with --method mtp: the MTP "

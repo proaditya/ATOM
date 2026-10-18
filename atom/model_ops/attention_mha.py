@@ -550,6 +550,36 @@ class PagedAttentionImpl(nn.Module):
         )
         return o
 
+    def _verify_splitkv_ok(self) -> bool:
+        """Can the split-KV verify kernel serve this layer's decode: a plain
+        bf16 shuffled paged cache, no sinks / window / ALiBi, a power-of-two
+        head dim."""
+        hd = self.head_dim
+        return (
+            not envs.ATOM_USE_UNIFIED_ATTN
+            and not self.use_flash_layout
+            and self.kv_cache_dtype == "bf16"
+            and self.sinks is None
+            and self.sliding_window in (-1, 0)
+            and hd >= 64
+            and hd & (hd - 1) == 0
+        )
+
+    @mark_trace(prefix="paged_attention_verify", torch_compile=False)
+    def paged_attention_verify(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        """Speculative verify past the gluon kernel's query length: split-KV,
+        the query rows of a KV head's group packed into one tile
+        (``triton_verify_splitkv``)."""
+        from atom.model_ops.attentions.triton_verify_splitkv import verify_attention
+
+        md = fwd_ctx.attn_metadata
+        return verify_attention(
+            q, k_cache, v_cache, md.block_tables, md.context_lens, md.cu_seqlens_q,
+            md.max_seqlen_q, self.scale,
+        )  # fmt: skip
+
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1005,6 +1035,8 @@ class PagedAttentionImpl(nn.Module):
             return self.paged_attention_unified
 
         if wants_unified:
+            if over_gluon and self._verify_splitkv_ok():
+                return self.paged_attention_verify
             return self.paged_attention_unified
         if self.use_triton_attn:
             return self.paged_attention_triton

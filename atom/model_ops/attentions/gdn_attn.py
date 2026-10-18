@@ -73,6 +73,15 @@ def slot_indexed_caches(runner, replayssm: bool) -> list[torch.Tensor]:
     return caches
 
 
+def _mono_owns_state(config) -> bool:
+    """Whether the Qwen3.8-27B megakernel serves this deployment's decode
+    steps; its pools then keep the layout the kernel reads (fp32 recurrent
+    state, one state slot per speculative token)."""
+    from atom.models.qwen38_27b.mono.config import serves
+
+    return serves(config)
+
+
 class GDNAttentionBackend(AiterBackend):
     @staticmethod
     def get_name() -> str:
@@ -210,7 +219,9 @@ class GDNStateMixin(PoolRowsMixin):
         # are none.  `ATOM_ENABLE_REPLAYSSM` overrides in either direction.
         replayssm_override = envs.ATOM_ENABLE_REPLAYSSM
         self.replayssm = (
-            self.use_spec_decode if replayssm_override is None else replayssm_override
+            self.use_spec_decode and not _mono_owns_state(model_runner.config)
+            if replayssm_override is None
+            else replayssm_override
         )
         self.replayssm_max_query_len = self.num_spec + 1
         self.replayssm_route = envs.ATOM_REPLAYSSM_ROUTE
@@ -395,6 +406,9 @@ class GDNStateMixin(PoolRowsMixin):
                     f"{sorted(_GDN_SSM_DTYPES)}."
                 )
             return (self.model_runner.config.torch_dtype, temporal_dtype)
+        if _mono_owns_state(self.model_runner.config):
+            # the Qwen3.8-27B megakernel reads and commits fp32 recurrent state
+            return (self.model_runner.config.torch_dtype, torch.float32)
         return (
             self.model_runner.config.torch_dtype,
             self.model_runner.config.torch_dtype,
@@ -559,13 +573,17 @@ class GDNStateMixin(PoolRowsMixin):
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         n = self.num_state_layers()
+        ssm = torch.zeros((n, num_slots) + shape_v, dtype=dt_v, device="cuda")
+        if _mono_owns_state(self.model_runner.config):
+            # The megakernel's state is [head][v][k], k contiguous: the "VK"
+            # layout the recurrent kernels take as a transposed view
+            # (`INIT_STATE_VK`, picked from `stride(-2) == 1`).
+            ssm = ssm.transpose(-1, -2)
         tensors = {
             "mamba_k_cache": torch.zeros(
                 (n, num_slots) + shape_k, dtype=dt_k, device="cuda"
             ),
-            "mamba_v_cache": torch.zeros(
-                (n, num_slots) + shape_v, dtype=dt_v, device="cuda"
-            ),
+            "mamba_v_cache": ssm,
         }
         shapes = self._replayssm_buffer_shapes()
         if shapes is not None:
@@ -1179,12 +1197,27 @@ class GDNStateMixin(PoolRowsMixin):
                     non_spec_state_indices[idx] = committed
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
-
-        if self.model_runner.tokenID_processor.num_bonus is None:
-            return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        # Staged on the host and copied once, asynchronously: an element-wise
+        # write into the device tensor is a synchronous copy per request, which
+        # waits for the stream (the previous step's draft) every step. A ring
+        # of pinned buffers, so a copy still queued is never overwritten.
+        ring = getattr(self, "_accepted_ring", None)
+        if ring is None:
+            n = self.num_accepted_tokens.shape[0]
+            dtype = self.num_accepted_tokens.dtype
+            ring = self._accepted_ring = [
+                torch.ones(n, dtype=dtype, pin_memory=True) for _ in range(4)
+            ]
+            self._accepted_ring_i = 0
+        self._accepted_ring_i = (self._accepted_ring_i + 1) % len(ring)
+        host = ring[self._accepted_ring_i]
+        host.fill_(1)
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        if num_bonus is not None and len(num_bonus):
+            host[: len(num_bonus)] = (
+                torch.from_numpy(np.asarray(num_bonus)).to(host.dtype) + 1
+            )
+        self.num_accepted_tokens.copy_(host, non_blocking=True)
 
     def prepare_gdn_metadata(
         self,

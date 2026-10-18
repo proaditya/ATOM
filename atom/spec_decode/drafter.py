@@ -132,6 +132,7 @@ support_draft_model_arch_dict = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
+    "DFlash2DraftModel": "atom.models.qwen3_dflash2.DFlash2DraftModel",
 }
 
 
@@ -406,6 +407,7 @@ class Drafter(abc.ABC):
             else:
                 module.register_forward_hook(hook)
         self._captures_aux = True
+        self.aux_layer_ids = tuple(spec.layer_ids)
         # A target that runs some layers on a subset of rows (V4.1 bounded
         # replay) moves those layers' captures to their forward rows itself.
         # The hooks above bind these buffers now, so the target gets the same
