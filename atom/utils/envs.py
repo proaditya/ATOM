@@ -380,8 +380,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
-    # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
+    # Fused per-layer decode (atom/models/minimax_m3/mono,
+    # atom/models/deepseek_v41/mono, atom/models/qwen38_27b/mono,
+    # atom/models/qwen4_exp_mono), on by default. Only a configuration the mono
     # path supports is ever routed to it; every other batch keeps the original
     # model. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
@@ -517,6 +518,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ModelRunner workers) to exit before it terminates them.
     "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
         "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
+    # --- Runner output ---
+    # ModelRunner workers send each RPC's output from their main thread instead
+    # of handing it to an output thread (atom/model_engine/async_proc.py).
+    "ATOM_RUNNER_INLINE_SEND": lambda: (
+        os.getenv("ATOM_RUNNER_INLINE_SEND", "0") == "1"
     ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(

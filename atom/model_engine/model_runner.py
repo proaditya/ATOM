@@ -151,6 +151,9 @@ mono_decode_installers = {
     "Qwen3_5ForConditionalGeneration": (
         "atom.models.qwen38_27b.mono.dispatch.install_mono_decode"
     ),
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen4_exp_mono.dispatch.install_mono_decode"
+    ),
 }
 
 

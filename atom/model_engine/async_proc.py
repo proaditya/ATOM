@@ -164,13 +164,27 @@ class AsyncIOProc:
         atexit.register(self._cleanup_shared_memory)
         init_exit_handler(self)
 
+        # With ATOM_RUNNER_INLINE_SEND=1 the main thread sends the primary
+        # output itself. Handing it to the output thread instead costs a
+        # wake-up and a GIL wait against the main thread, which spins in
+        # dequeue for the next RPC: about 0.6 ms between forwards on average
+        # and 1-20 ms on about 8% of them (Qwen3.8 mono decode, MTP k=1).
+        self._out_socket = None
+        if envs.ATOM_RUNNER_INLINE_SEND and io_addrs[1]:
+            self._out_ctx = zmq.Context()
+            self._out_socket = make_zmq_socket(
+                self._out_ctx, io_addrs[1], zmq.PUSH, linger=4000
+            )
+
         # Start I/O threads for primary input/output
         for addr, q, func in zip(
             self.io_addrs,
             self.io_queues,
             [self.recv_input_from_socket, self.send_output_to_socket],
         ):
-            if addr is None:
+            if addr is None or (
+                func == self.send_output_to_socket and self._out_socket is not None
+            ):
                 continue
             t = threading.Thread(target=func, args=(addr, q), daemon=True)
             t.start()
@@ -272,7 +286,10 @@ class AsyncIOProc:
                         self.io_addrs[1] is not None
                         and func_name not in self._KV_FUNC_NAMES
                     ):
-                        self.io_queues[1].put_nowait(out)
+                        if self._out_socket is not None:
+                            self._out_socket.send(pickle.dumps(out))
+                        else:
+                            self.io_queues[1].put_nowait(out)
                     if self.kv_queue is not None and func_name in self._KV_FUNC_NAMES:
                         self.kv_queue.put_nowait(out)
             if func_name == "exit":

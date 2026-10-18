@@ -113,7 +113,10 @@ def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_dra
     monkeypatch.setattr(
         qsa_attention,
         "get_forward_context",
-        lambda: SimpleNamespace(context=SimpleNamespace(is_draft=is_draft)),
+        # A decode step: the FlyDSL selection runs only in prefill (allow_flydsl).
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_draft=is_draft, is_prefill=False)
+        ),
     )
     layers = [
         SimpleNamespace(
@@ -492,6 +495,49 @@ def test_qsa_draft_slots_follow_accepted_tail_and_page_boundary(k):
     )
     assert slots.tolist() == [-1, -1, -1]
     assert compressed.tolist() == [-1, -1, -1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("sections", [0, 1, 3])
+@pytest.mark.parametrize("reject", [False, True])
+def test_qsa_draft_metadata_bump_is_eagles_increment(sections, reject):
+    """The fused advance is EagleProposer's ``context_lens += 1`` and
+    ``positions += 1`` (1-D, or mRoPE's [sections, rows]) before the update."""
+    device, block, ratio, rows = "cuda", 16, 4, 3
+    tables = torch.tensor(
+        [[7, 3, 9], [2, 8, 6], [1, 4, 5]], device=device, dtype=torch.int32
+    )
+    rejects = torch.tensor([1, 0], device=device, dtype=torch.int32) if reject else None
+    lengths = torch.tensor([17, 31, 42], device=device, dtype=torch.int32)
+    shape = (sections, rows) if sections else (rows,)
+    positions = torch.arange(lengths.numel() * max(sections, 1), device=device)
+    positions = positions.view(shape) + 100
+    results = []
+    for fused in (False, True):
+        lens, pos = lengths.clone(), positions.clone()
+        slots, logical, compressed = [
+            torch.empty(rows, device=device, dtype=torch.int64) for _ in range(3)
+        ]
+        reqs = torch.empty(rows, device=device, dtype=torch.int32)
+        if not fused:
+            lens += 1
+            pos += 1
+        qsa_draft_decode_metadata(
+            lens,
+            tables,
+            rejects,
+            slots,
+            logical,
+            reqs,
+            compressed,
+            2,
+            block,
+            ratio,
+            bumped_positions=pos if fused else None,
+        )
+        results.append((lens, pos, slots, logical, compressed, reqs))
+    for unfused, fused in zip(*results):
+        assert torch.equal(unfused, fused)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

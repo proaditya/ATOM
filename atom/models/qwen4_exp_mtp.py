@@ -143,7 +143,7 @@ class Qwen4ExpMTP(nn.Module):
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
 
     def _head_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.model.hyper_connection_mixer.mix(hidden_states.flatten(1))[0]
+        return self.model.hyper_connection_mixer.mix_final(hidden_states.flatten(1))
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

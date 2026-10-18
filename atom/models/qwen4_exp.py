@@ -298,6 +298,9 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             ),
             shared_expert_scoring_func="sigmoid" if self.fuse_shared else None,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            # MXFP4 experts run on MXFP8 activations, as the MXFP4 checkpoint's
+            # reference computes them; other expert formats ignore this.
+            mxfp4_fp8_activations=True,
         )
         install_stacked_expert_loaders(self.experts)
         self._single_token_ok: bool | None = None
@@ -398,8 +401,9 @@ class Qwen4ExpLinearAttention(nn.Module):
     Same recurrence as Qwen3-Next -- ATOM's `LinearAttention` / `GatedDeltaNet`
     run it unchanged. Separate checkpoint projections are packed into the
     existing MergedColumnParallelLinear at load time, with Q/K/V sharded
-    independently. PTPC inputs use an FP8 QKVZ projection and a BF16 BA
-    projection; unquantized inputs retain the single packed QKVZBA projection.
+    independently. PTPC FP8 or MXFP4 inputs use a quantized QKVZ projection
+    and a BF16 BA projection; unquantized inputs retain the single packed
+    QKVZBA projection.
     """
 
     @property
@@ -430,15 +434,18 @@ class Qwen4ExpLinearAttention(nn.Module):
             )
             if self.quantized_inputs and not (
                 qkv == z
-                and qkv.quant_type == QuantType.per_Token
-                and qkv.quant_dtype == dtypes.fp8
+                and (qkv.quant_type, qkv.quant_dtype)
+                in (
+                    (QuantType.per_Token, dtypes.fp8),
+                    (QuantType.per_1x32, dtypes.fp4x2),
+                )
                 and qkv.is_dynamic
                 and not b.is_quantized
                 and not a.is_quantized
             ):
                 raise ValueError(
                     "Qwen GDN requires unquantized inputs or matching dynamic "
-                    "per-channel FP8 QKV/Z with unquantized B/A"
+                    "per-channel FP8 or MXFP4 QKV/Z with unquantized B/A"
                 )
             if quant_config.online_quant:
                 for projection in ("qkv", "z", "b", "a"):
@@ -1050,7 +1057,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor):
         if self.extra_output_dims:
-            hidden_states, _ = self.model.hyper_connection_mixer.mix(
+            hidden_states = self.model.hyper_connection_mixer.mix_final(
                 hidden_states.flatten(1)
             )
         return self.lm_head(hidden_states)

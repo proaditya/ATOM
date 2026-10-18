@@ -147,6 +147,15 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     """GDN hybrid plus the QSA side caches and the PLE state."""
 
     BACKEND = Qwen4ExpBackend
+    # `prepare_mtp_decode` advances the draft step's lengths and positions
+    # (mRoPE's too) in its own launch
+    fuse_mtp_decode_position_update = True
+    fuse_mtp_decode_mrope_positions = True
+    # Store the recurrent state VK even when the decode policy does not need
+    # it: set (before the caches are allocated) by a consumer that reads the
+    # state in place as VK, the mono decode (``qwen4_exp_mono``). ATOM's own
+    # kernels take either layout through the view's strides.
+    gdn_state_vk = False
 
     def _build_gdn_cache_tensor(self, module):
         cache = super().build_kv_cache_tensor(module)
@@ -166,7 +175,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
             )
-            if policy.decode:
+            if policy.decode or self.gdn_state_vk:
                 # Physical VK storage, exposed as a logical KV view. This is
                 # zero-copy and preserves all gather/scatter/fork interfaces.
                 # Triton fallback and checkpoint stores honor the inner strides.
@@ -204,6 +213,20 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         self.model_runner.forward_vars["ple_has_initial_state"] = CpuGpuBuffer(
             self.max_bs, dtype=torch.bool, device=self.device, publication_group="ple"
         )
+        # (buffer, n): its first n device rows are True, as decode last
+        # published them (see `_build_ple_metadata`)
+        self._ple_all_initial = None
+        # The accepted counts, published from pinned memory in one copy (see
+        # `prepare_num_accepted_tokens`)
+        self._num_accepted = CpuGpuBuffer(
+            self.max_bs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=torch.device(self.device).type != "cpu",
+        )
+        self._num_accepted.cpu.fill_(1)
+        self._num_accepted.gpu.fill_(1)
+        self.num_accepted_tokens = self._num_accepted.gpu
 
     # ------------------------------------------------------------------ #
     # Geometry                                                            #
@@ -530,22 +553,32 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         # A cold first chunk must not fold in whatever the recycled state slot
         # still held; anything with cached tokens continues its own window.
         self._check_metadata_writable("ple")
-        has_initial = self.model_runner.forward_vars["ple_has_initial_state"].np
+        buffer = self.model_runner.forward_vars["ple_has_initial_state"]
         if is_prefill:
-            has_initial[:num_reqs] = (
+            buffer.np[:num_reqs] = (
                 np.asarray(batch.num_cached_tokens[:num_reqs], dtype=np.int64) > 0
             )
+            self._ple_all_initial = None
+            has_initial_state = buffer.copy_to_gpu(num_reqs)
+        elif (
+            self._ple_all_initial is not None
+            and self._ple_all_initial[0] is buffer
+            and num_reqs <= self._ple_all_initial[1]
+        ):
+            # Decode's are all True, as published by an earlier decode step
+            # that covered these rows: nothing to upload.
+            has_initial_state = buffer.gpu[:num_reqs]
         else:
-            has_initial[:num_reqs] = True
+            buffer.np[:num_reqs] = True
+            self._ple_all_initial = (buffer, num_reqs)
+            has_initial_state = buffer.copy_to_gpu(num_reqs)
 
         return Qwen4ExpPLEMetadata(
             query_start_loc=attn_metadata.cu_seqlens_q[: num_reqs + 1],
             ngram_state=self.model_runner.ple_ngram_state,
             state_indices_in=state_indices_in[:num_reqs],
             state_indices_out=state_indices_out[:num_reqs],
-            has_initial_state=self.model_runner.forward_vars[
-                "ple_has_initial_state"
-            ].copy_to_gpu(num_reqs),
+            has_initial_state=has_initial_state,
             conv_state=conv_state,
             num_accepted_tokens=attn_metadata.gdn_metadata.num_accepted_tokens,
         )
@@ -622,6 +655,17 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         return attn_metadata, positions
 
+    def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
+        # One asynchronous copy from pinned memory. The parent's per-request
+        # writes are pageable copies that each wait for the stream to drain,
+        # holding the host until the previous step's draft has finished.
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        host = self._num_accepted.np
+        host.fill(1)
+        if num_bonus is not None:
+            host[: len(num_bonus)] = num_bonus + 1
+        self._num_accepted.copy_to_gpu()
+
     def _refreshed_flydsl_plan(self, var, running_bs: int):
         """The draft's own plan, never the target's.
 
@@ -640,12 +684,23 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         positions: torch.Tensor,
         only_update: bool = False,
         num_reject_tokens: torch.Tensor | None = None,
+        *,
+        update_context_lens: bool = False,
+        positions_out: torch.Tensor | None = None,
     ) -> dict:
-        """Move the draft's paged QSA view to the accepted sequence tail."""
+        """Move the draft's paged QSA view to the accepted sequence tail.
+
+        With ``update_context_lens`` it first advances the step one token, as
+        ``EagleProposer`` does unfused: ``context_lens`` and ``positions_out``
+        (the step's positions, updated in place) one on."""
         running_bs = positions.shape[-1]
         var = self.model_runner.forward_vars
         slots = var["slot_mapping"].gpu[:running_bs]
+        assert update_context_lens == (positions_out is not None)
         if getattr(self, "qsa_arena", None) is None:
+            if update_context_lens:
+                var["context_lens"].gpu[:running_bs] += 1
+                positions_out += 1
             # Allocation profiling runs all draft steps before the pools exist.
             return {
                 "slot_mapping": slots,
@@ -668,6 +723,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             bs,
             self.block_size,
             self._compress_ratio,
+            bumped_positions=positions_out,
         )
         return {
             "slot_mapping": slots,
@@ -719,6 +775,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             return attn_metadata, context
         state_indices_in, state_indices_out = slots
         self._check_metadata_writable("ple")
+        self._ple_all_initial = None
         self.model_runner.forward_vars["ple_has_initial_state"].np[:bs] = True
         attn_metadata.ple_metadata = Qwen4ExpPLEMetadata(
             query_start_loc=attn_metadata.cu_seqlens_q[: bs + 1],

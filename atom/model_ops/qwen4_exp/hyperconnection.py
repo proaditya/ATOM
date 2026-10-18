@@ -42,6 +42,9 @@ from atom.model_ops.qwen4_exp.ops.hc_fused import (
 # Up to this many tokens the two fused kernels beat norm + GEMMs; each row
 # re-reads the (cache resident) weights, so the cost grows with the batch.
 HC_ROWS_MAX = 2
+# The final mixers' `mix_final` (the logits' and the MTP draft heads' input) runs
+# `hc_rows` up to this many rows: decode, verify and draft steps.
+HC_FINAL_ROWS_MAX = 8
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
 
@@ -116,6 +119,25 @@ class Qwen4ExpHyperConnection(nn.Module):
         gate = self.input_mix_weight_up(gate, otype=gate.dtype)
         mixed = mix_gated_mean(normed, gate, self.hc_count)
         return mixed.to(hyper_input.dtype), (hyper_input, normed)
+
+    def mix_final(self, hyper_input: torch.Tensor) -> torch.Tensor:
+        """`mix`'s mixed activation, for a final mixer (no block injection).
+
+        Up to `HC_FINAL_ROWS_MAX` rows it is `hc_rows`' two kernels, as the
+        target's own final mix (`mix_fused`) runs, instead of `mix`'s six.
+        """
+        if hyper_input.shape[0] > HC_FINAL_ROWS_MAX:
+            return self.mix(hyper_input)[0]
+        _, mixed, _ = hc_rows(
+            hyper_input,
+            self.hc_norm.weight,
+            self.fused_w_cat,
+            self.input_mix_weight_up.weight,
+            self.hc_norm.variance_epsilon,
+            self.hc_count,
+            self.block_inject_weight is not None,
+        )
+        return mixed
 
     def combine(
         self,

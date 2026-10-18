@@ -579,8 +579,10 @@ class EagleProposer(Drafter):
         # TODO: FIX this condition after we support3 attention head numbers=32
         only_update = not from_prefill and builder.num_attention_heads != 32
         attn_metadata.max_seqlen_k += 1
-        fuse_mtp = positions.ndim == 1 and getattr(
-            builder, "fuse_mtp_decode_position_update", False
+        # A builder taking mRoPE's [sections, rows] positions says so
+        fuse_mtp = getattr(builder, "fuse_mtp_decode_position_update", False) and (
+            positions.ndim == 1
+            or getattr(builder, "fuse_mtp_decode_mrope_positions", False)
         )
         if fuse_mtp:
             mtp_decode_kwargs = {

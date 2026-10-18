@@ -98,7 +98,7 @@ def _kernel_config(
     return 32, 4, 1, 3, sub_group
 
 
-@triton.jit(do_not_specialize=["N", "REAL"])
+@triton.jit(do_not_specialize=["N", "REAL", "bumped_stride"])
 def _draft_decode_metadata(
     Lengths,
     Tables,
@@ -107,17 +107,26 @@ def _draft_decode_metadata(
     Positions,
     Requests,
     Compressed,
+    Bumped,
     N,
     REAL,
+    bumped_stride,
     TS: tl.constexpr,
     PAGE: tl.constexpr,
     RATIO: tl.constexpr,
     HAS_REJECT: tl.constexpr,
+    BUMP_ROWS: tl.constexpr,
     B: tl.constexpr,
 ):
     req = tl.program_id(0) * B + tl.arange(0, B)
     live = req < REAL
     length = tl.load(Lengths + req, req < N, 0)
+    if BUMP_ROWS > 0:
+        # the draft step's own advance: every row's length and position one on
+        length += 1
+        for r in tl.static_range(BUMP_ROWS):
+            at = Bumped + r * bumped_stride + req
+            tl.store(at, tl.load(at, req < N) + 1, req < N)
     if HAS_REJECT:
         length -= tl.load(Reject + req, live, 0)
     length = tl.where(live, length, 0)
@@ -147,9 +156,20 @@ def qsa_draft_decode_metadata(
     real_requests: int,
     block_size: int,
     compress_ratio: int,
+    bumped_positions: torch.Tensor | None = None,
 ) -> None:
-    """Update draft lengths and physical write slots after verification."""
-    _draft_decode_metadata[(triton.cdiv(lengths.numel(), 128),)](
+    """Update draft lengths and physical write slots after verification.
+
+    With ``bumped_positions`` (the step's positions, ``[rows]`` or mRoPE's
+    ``[sections, rows]``) the step's own advance runs here first: ``lengths``
+    and ``bumped_positions`` one on, as ``EagleProposer``'s ``+= 1`` does."""
+    n = lengths.numel()
+    bumped, bump_rows, stride = lengths, 0, 0
+    if bumped_positions is not None:
+        bumped = bumped_positions.view(-1, bumped_positions.shape[-1])
+        assert bumped.shape[1] == n and bumped.stride(1) == 1
+        bump_rows, stride = bumped.shape[0], bumped.stride(0)
+    _draft_decode_metadata[(triton.cdiv(n, 128),)](
         lengths,
         tables,
         rejected,
@@ -157,12 +177,15 @@ def qsa_draft_decode_metadata(
         positions,
         requests,
         compressed,
-        lengths.numel(),
+        bumped,
+        n,
         real_requests,
+        stride,
         tables.stride(0),
         block_size,
         compress_ratio,
         rejected is not None,
+        bump_rows,
         128,
     )
 
