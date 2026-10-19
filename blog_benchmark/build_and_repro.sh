@@ -19,10 +19,14 @@
 #   MODEL, DRAFT   local checkpoint directories or Hugging Face ids  (default Qwen/Qwen3.8-27B, incoai/Qwen3.8-27B-DFlash2)
 #   FLYDSL_SRC     a FlyDSL checkout or source tarball at commit 19418894  (default: cloned from github.com/ROCm/FlyDSL)
 #   FLYDSL_WHEEL   the flydsl 0.4.0.dev963 wheel for this Python             (default: downloaded from PyPI)
+#   FLYDSL_DIR     where step 3 sets FlyDSL up                               (default $WORK/flydsl)
+#   DRAFTER_OBJECTS  where step 4 exports the drafter code objects           (default $WORK/drafter-objects)
+#   ATOM_QWEN38_MK_CACHE  the megakernel code-object cache                    (default $WORK/kernel-cache)
+#   SETUP_ONLY=1   steps 1, 3 and 4 only: no GPU, checkpoint or server (a container build prebuilds with it)
 #   ARMS           "megakernel regular" or one of them                       (default both)
 #   RUN_SGLANG=1   also run SGLang with the plugin; needs AITERMK=<aitermk checkout> and SGLang with DFLASH
 #   PORT           server port                                               (default 8000)
-#   GPU_MAX_HW_QUEUES  HIP hardware queues per device for the servers     (default 2; see step 6)
+#   GPU_MAX_HW_QUEUES  HIP hardware queues per device for the servers     (default 1; see step 6)
 
 set -euo pipefail
 
@@ -37,11 +41,12 @@ FLYDSL_COMMIT=19418894
 FLYDSL_VERSION=0.4.0.dev963
 SETS="gsm8k:128 humaneval:128 mt-bench:80"
 export AITER_LOG_LEVEL=WARNING
+SETUP_ONLY="${SETUP_ONLY:-0}"
 mkdir -p "$WORK"
 step() { printf '\n== %s\n' "$*"; }
 
 step "0. checks"
-if command -v rocminfo > /dev/null; then rocminfo 2> /dev/null | grep gfx950 > /dev/null || { echo "needs an MI355X (gfx950)" >&2; exit 1; }; fi
+if [ "$SETUP_ONLY" != 1 ] && command -v rocminfo > /dev/null; then rocminfo 2> /dev/null | grep gfx950 > /dev/null || { echo "needs an MI355X (gfx950)" >&2; exit 1; }; fi
 
 step "1. ATOM"
 "$PY" -c "import atom" 2> /dev/null || "$PY" -m pip install -e "$ATOM_ROOT"
@@ -54,13 +59,17 @@ fetch() {  # fetch ID_OR_DIR -> prints a local directory
 snapshot_download(sys.argv[1], local_dir=sys.argv[2])" "$1" "$dst" > /dev/null
     echo "$dst"
 }
-MODEL=$(fetch "$MODEL")
-DRAFT=$(fetch "$DRAFT")
-echo "model $MODEL"
-echo "draft $DRAFT"
+if [ "$SETUP_ONLY" = 1 ]; then
+    echo "skipped (SETUP_ONLY)"
+else
+    MODEL=$(fetch "$MODEL")
+    DRAFT=$(fetch "$DRAFT")
+    echo "model $MODEL"
+    echo "draft $DRAFT"
+fi
 
 step "3. FlyDSL (build time only; serving loads the code objects)"
-FLY="$WORK/flydsl"
+FLY="${FLYDSL_DIR:-$WORK/flydsl}"
 if [ ! -f "$FLY/READY" ]; then
     rm -rf "$FLY" && mkdir -p "$FLY/src" "$FLY/wheel" "$FLY/python"
     if [ -d "${FLYDSL_SRC:-}" ]; then
@@ -100,13 +109,14 @@ step "4. code objects"
 export ATOM_QWEN38_MK_CACHE="${ATOM_QWEN38_MK_CACHE:-$WORK/kernel-cache}"
 export ATOM_QWEN38_MK_FLYDSL="$FLY/python"
 "$PY" -c "from atom.models.qwen38_27b.mono.kernels.build import build; print('megakernel', build('m8'))"
-DFLASH2_AOT="$WORK/drafter-objects"
+DFLASH2_AOT="${DRAFTER_OBJECTS:-$WORK/drafter-objects}"
 if [ ! -f "$DFLASH2_AOT/manifest.json" ]; then
     PYTHONPATH="$FLY/python${PYTHONPATH:+:$PYTHONPATH}" FLY_KERNELS_ROOT="$FLY/src" \
         PROTO_ROOT="$ATOM_ROOT/atom/models/qwen38_27b/mono/drafter/kernels_src" \
         "$PY" atom/models/qwen38_27b/mono/drafter/aot_runtime.py export --out "$DFLASH2_AOT" --P 40968
 fi
 echo "drafter $DFLASH2_AOT"
+[ "$SETUP_ONLY" = 1 ] && exit 0
 export ATOM_DFLASH2_AOT="$DFLASH2_AOT"
 
 step "5. prompt sets"
@@ -143,9 +153,10 @@ trap stop EXIT
 
 step "6. ATOM: the megakernel, then the regular path"
 # ROCm 10 (TheRock wheel images): with HIP's default four hardware queues per device every kernel of a megakernel
-# round runs ~8 us longer (6.1 instead of 5.5 ms per round on an MI350X); two queues serve this one-request decode
-# without it. ROCm 7.2 is unaffected either way, and the regular path does not change.
-export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-2}"
+# round runs ~8 us longer (6.1 instead of 5.5 ms per round on an MI350X). One queue removes that and is also the
+# regular path's faster setting (about 8% faster than two on an MI355X); the published numbers use it on both paths.
+# ROCm 7.2 is unaffected.
+export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-1}"
 for arm in ${ARMS:-megakernel regular}; do
     out="$WORK/results/atom/$arm"; mkdir -p "$out"
     set -- --model "$MODEL" --kv_cache_dtype bf16 -tp 1 --max-model-len 40000 --max-num-seqs 4 --server-port "$PORT" \
@@ -186,7 +197,8 @@ step "8. results (tokens/s, mean of each request's decode speed)"
 "$PY" - "$WORK/results" << 'PYEOF'
 import json, os, sys
 root = sys.argv[1]
-published = {"gsm8k": (481, 1105), "humaneval": (406, 924), "mt-bench": (368, 846)}
+# MI355X, ROCm 10.0, GPU_MAX_HW_QUEUES=1 on both paths (the script's default)
+published = {"gsm8k": (535, 1091), "humaneval": (443, 913), "mt-bench": (412, 824)}
 def summary(*parts):
     f = os.path.join(root, *parts)
     return json.load(open(f))["summary"] if os.path.exists(f) else {}
@@ -198,5 +210,7 @@ for name, (pr, pm) in published.items():
     g = summary("sglang", name + ".json").get("decode_tok_s_per_request_mean")
     sp = f"{m / r:7.1f}x" if r and m else "       -"
     print(f"{name:10s} {fmt(r):>8s} {fmt(m):>11s} {sp:>8s} {fmt(g):>8s}   {pr} / {pm}")
-print("\nThe megakernel is not bit-reproducible run to run, so speeds move by a few percent with the acceptance length.")
+print("\npublished: MI355X, ROCm 10.0, GPU_MAX_HW_QUEUES=1 on both paths (the script's default). On ROCm 7.2.4 at HIP's defaults: "
+      "481 / 1,105, 406 / 924, 368 / 846 (2.3x); on ROCm 10 the hardware-queue setting also sped up the regular path on that MI355X.")
+print("The megakernel is not bit-reproducible run to run, so speeds move by a few percent with the acceptance length.")
 PYEOF

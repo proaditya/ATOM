@@ -74,10 +74,10 @@ The megakernel serves a deployment when (`config.config_refusal`):
 It then keeps the recurrent state in fp32 in the layout the kernel reads
 (`[head][v][k]`, the "VK" transposed view ATOM's recurrent kernels accept).
 
-On ROCm 10 images (ROCm as TheRock wheels), serve with `GPU_MAX_HW_QUEUES=2`: with
+On ROCm 10 images (ROCm as TheRock wheels), serve with `GPU_MAX_HW_QUEUES=1`: with
 HIP's default of four hardware queues per device every kernel of a megakernel
-round runs ~8 us longer (6.1 instead of 5.5 ms per round on an MI350X). ROCm 7.2
-is unaffected, and so is the per-op path.
+round runs ~8 us longer (6.1 instead of 5.5 ms per round on an MI350X), and one
+queue is also ATOM's regular path's faster setting. ROCm 7.2 is unaffected.
 With speculation every request holds `num_speculative_tokens + 1` fp32 state
 slots (~150 MB each), so keep `--max-num-seqs` small.
 
@@ -161,13 +161,16 @@ bash blog_benchmark/build_and_repro.sh
 The client, `atom/benchmarks/single_request_bench.py`, works against any OpenAI-compatible server (ATOM,
 vLLM, SGLang). It reports each request's decode speed (output tokens after the first over the time after the
 first) and its mean, the acceptance length and the time per round from ATOM's `/debug/mtp_stats`. Measured
-on one MI355X (2026-10-14):
+on one MI355X, ROCm 10.0, GPU_MAX_HW_QUEUES=1 on both paths:
 
-| set | regular path, MXFP4 | megakernel | ms per round |
-|---|---:|---:|---|
-| GSM8K (128) | 481 tok/s | 1,105 tok/s | 11.33 / 5.07 |
-| HumanEval (128) | 406 tok/s | 924 tok/s | 11.39 / 5.09 |
-| MT-Bench (80) | 368 tok/s | 846 tok/s | 11.36 / 5.08 |
+| set | regular path, MXFP4 | megakernel | speedup |
+|---|---:|---:|---:|
+| GSM8K (128) | 535 tok/s | 1,091 tok/s | 2.0x |
+| HumanEval (128) | 443 tok/s | 913 tok/s | 2.1x |
+| MT-Bench (80) | 412 tok/s | 824 tok/s | 2.0x |
+
+On ROCm 7.2.4 at HIP's defaults (2026-10-14): 481 / 1,105, 406 / 924, 368 / 846 tok/s (2.3x), at 11.33-11.39 /
+5.07-5.09 ms per round; on ROCm 10 the hardware-queue setting also sped up the regular path on that MI355X.
 
 The megakernel is not bit-reproducible run to run (see Validation), so speeds move with the acceptance
 length by a few percent between runs; the time per round is the stable figure.

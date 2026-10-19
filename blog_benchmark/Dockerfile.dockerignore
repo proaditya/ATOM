@@ -1,0 +1,6 @@
+# the build context of ./Dockerfile (the checkout): no git history, local outputs or caches
+.git
+blog_benchmark/work
+**/__pycache__
+**/*.egg-info
+**/.pytest_cache
