@@ -29,10 +29,24 @@ _ATTR_PRIVATE = 3
 _hip = None
 
 
+def runtime_library() -> str:
+    """The HIP runtime torch uses. Images that ship ROCm as wheels (TheRock, e.g.
+    ROCm 10) hold more than one ``libamdhip64.so``: loading another one by name
+    gives the process a second HIP runtime, in which torch's streams do not exist
+    (a launch fails with hipErrorContextIsDestroyed)."""
+    torch.cuda.init()
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            path = line.split()[-1]
+            if "/libamdhip64.so" in path:
+                return path
+    return "libamdhip64.so"
+
+
 def hip():
     global _hip
     if _hip is None:
-        lib = ct.CDLL("libamdhip64.so")
+        lib = ct.CDLL(runtime_library())
         for name, args in _SIGNATURES.items():
             getattr(lib, name).argtypes = args
             getattr(lib, name).restype = ct.c_int

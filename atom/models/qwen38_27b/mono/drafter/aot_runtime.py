@@ -88,10 +88,18 @@ _SIG = {
 _hip = None
 
 
+def _runtime_library():
+    """The HIP runtime torch uses (``kernels/hip.py``: a wheel-installed ROCm can
+    hold a second libamdhip64)."""
+    from atom.models.qwen38_27b.mono.kernels.hip import runtime_library
+
+    return runtime_library()
+
+
 def _lib():
     global _hip
     if _hip is None:
-        lib = ct.CDLL("libamdhip64.so")
+        lib = ct.CDLL(_runtime_library())
         for n, a in _SIG.items():
             getattr(lib, n).argtypes = a
             getattr(lib, n).restype = ct.c_int

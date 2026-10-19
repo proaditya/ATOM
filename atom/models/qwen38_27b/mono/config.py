@@ -78,10 +78,14 @@ def model_matches(hf) -> bool:
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use the Qwen3.8-27B megakernel, or None."""
     hf = atom_config.hf_config
+    # Other models answer here, before any field only a full Config has (the GDN
+    # pools ask this of every hybrid model, including test stand-ins).
+    if not envs.ATOM_MONO_ENABLE:
+        return "switched off"
+    if not model_matches(hf):
+        return "not the Qwen3.8-27B dense hybrid"
     spec = atom_config.speculative_config
     checks = [
-        (envs.ATOM_MONO_ENABLE, "switched off"),
-        (model_matches(hf), "not the Qwen3.8-27B dense hybrid"),
         (
             atom_config.tensor_parallel_size == 1,
             f"TP{atom_config.tensor_parallel_size}",

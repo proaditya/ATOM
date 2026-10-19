@@ -21,6 +21,9 @@ gsm8k           481        1105     2.3x        -   481 / 1105
 - `MODEL` / `DRAFT`: local checkpoints instead of downloads; `FLYDSL_SRC` / `FLYDSL_WHEEL`: local FlyDSL copies.
 - `RUN_SGLANG=1 AITERMK=<aitermk checkout>`: also run SGLang with the plugin (needs SGLang main with DFLASH).
 - Everything goes under `blog_benchmark/work/` (override with `WORK`); reruns skip what is already built.
+- The servers run with `GPU_MAX_HW_QUEUES=2`: on ROCm 10 HIP's default of four hardware queues makes every kernel of
+  a megakernel round slower (6.1 instead of 5.5 ms per round on an MI350X). ROCm 7.2 and the regular path are
+  unaffected.
 
 ## Measuring your own setup
 

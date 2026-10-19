@@ -22,6 +22,7 @@
 #   ARMS           "megakernel regular" or one of them                       (default both)
 #   RUN_SGLANG=1   also run SGLang with the plugin; needs AITERMK=<aitermk checkout> and SGLang with DFLASH
 #   PORT           server port                                               (default 8000)
+#   GPU_MAX_HW_QUEUES  HIP hardware queues per device for the servers     (default 2; see step 6)
 
 set -euo pipefail
 
@@ -141,6 +142,10 @@ stop() { [ -n "$SERVER_PID" ] && { kill "$SERVER_PID" 2> /dev/null || true; wait
 trap stop EXIT
 
 step "6. ATOM: the megakernel, then the regular path"
+# ROCm 10 (TheRock wheel images): with HIP's default four hardware queues per device every kernel of a megakernel
+# round runs ~8 us longer (6.1 instead of 5.5 ms per round on an MI350X); two queues serve this one-request decode
+# without it. ROCm 7.2 is unaffected either way, and the regular path does not change.
+export GPU_MAX_HW_QUEUES="${GPU_MAX_HW_QUEUES:-2}"
 for arm in ${ARMS:-megakernel regular}; do
     out="$WORK/results/atom/$arm"; mkdir -p "$out"
     set -- --model "$MODEL" --kv_cache_dtype bf16 -tp 1 --max-model-len 40000 --max-num-seqs 4 --server-port "$PORT" \

@@ -203,7 +203,7 @@ def _q6(c, p, t):
 
     if t < c.L.tasks["q6"]:
         kv = hq // GROUP
-        cb, n, ak = list_len(L)
+        _cb, _n, ak = list_len(L)
         nt = (ak + SCORE_TILE - 1) // SCORE_TILE
         mbx.pre_poll(
             lambda m: (c.mb_ssh, mb_ix(2 * fx.min(m, nt - 1) + kv, rq)),

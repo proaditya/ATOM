@@ -285,13 +285,18 @@ class _Layer:
         self.num_kv_heads = num_kv_heads
         self.use_triton_attn = flags.get("use_triton_attn", False)
         self.use_flash_layout = flags.get("use_flash_layout", False)
+        self._splitkv_ok = flags.get("verify_splitkv_ok", False)
         for name in (
             "paged_attention_unified",
             "paged_attention_triton",
             "paged_attention_asm",
             "paged_attention_persistent_asm",
+            "paged_attention_verify",
         ):
             setattr(self, name, name)
+
+    def _verify_splitkv_ok(self):
+        return self._splitkv_ok
 
 
 def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
@@ -319,6 +324,11 @@ class TestDecodeRouting:
 
     def test_past_gluon_falls_back_to_unified(self, monkeypatch):
         assert _route(monkeypatch, 5) == "paged_attention_unified"
+
+    def test_past_gluon_takes_splitkv_verify_when_it_fits(self, monkeypatch):
+        assert (
+            _route(monkeypatch, 5, verify_splitkv_ok=True) == "paged_attention_verify"
+        )
 
     def test_past_asm_but_within_gluon_takes_gluon(self, monkeypatch):
         """4 x 16 = 64 clears gluon and is four times ASM's envelope.

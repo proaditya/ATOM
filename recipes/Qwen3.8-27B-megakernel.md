@@ -73,6 +73,11 @@ The megakernel serves a deployment when (`config.config_refusal`):
 
 It then keeps the recurrent state in fp32 in the layout the kernel reads
 (`[head][v][k]`, the "VK" transposed view ATOM's recurrent kernels accept).
+
+On ROCm 10 images (ROCm as TheRock wheels), serve with `GPU_MAX_HW_QUEUES=2`: with
+HIP's default of four hardware queues per device every kernel of a megakernel
+round runs ~8 us longer (6.1 instead of 5.5 ms per round on an MI350X). ROCm 7.2
+is unaffected, and so is the per-op path.
 With speculation every request holds `num_speculative_tokens + 1` fp32 state
 slots (~150 MB each), so keep `--max-num-seqs` small.
 
