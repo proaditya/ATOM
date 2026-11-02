@@ -591,7 +591,7 @@ def build_verify_m8(layer_count=64, diagnostics=False):
                 fc_rounded_sum = (fc_data.to(fx.Float32) + fc_skip.to(fx.Float32)).to(fx.BFloat16)
                 fc_norm = (fc_rounded_sum.to(fx.Float32) * fc_rms * fc_gamma.to(fx.Float32)).to(fx.BFloat16)
                 fc_store_offset = nrm_offset(fc_valid, fc_offset * 2)
-                nrm_st16(fc_od, fc_store_offset, fc_rounded_sum.bitcast(fx.Int32), 3)
+                nrm_st16(fc_od, fc_store_offset, fc_rounded_sum.bitcast(fx.Int32), 17)
                 nrm_st16(fc_nd, fc_store_offset, fc_norm.bitcast(fx.Int32), 3)
                 fc_raw = fc_norm.bitcast(fx.Int32)
                 fc_values = fc_norm.to(fx.Float32)
