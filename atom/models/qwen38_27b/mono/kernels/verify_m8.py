@@ -2786,7 +2786,7 @@ def build_verify_m8(layer_count=64, diagnostics=False):
                 if iteration_block != 0:
                     worker = iteration_block - 136
                 for index in range(worker * 256 + iteration_tid, 40960, 8 * 256):
-                    fx.ptr_store(fx.BFloat16(0.0), mixer + index)
+                    llvm.InlineAsmOp(None, [fx.Uint64(fx.ptrtoint(mixer + index)).ir_value(), fx.Int32(0).ir_value()], 'global_store_short $0, $1, off sc0 sc1', 'v,v,~{memory}', has_side_effects=True)
 
             def fill_up_padding(scales):
                 index = iteration_block * 256 + iteration_tid
