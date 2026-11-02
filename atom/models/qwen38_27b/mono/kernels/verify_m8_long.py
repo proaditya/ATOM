@@ -587,7 +587,7 @@ def build_verify_m8_long(layer_count=64, diagnostics=False):
                 fc_rounded_sum = (fc_data.to(fx.Float32) + fc_skip.to(fx.Float32)).to(fx.BFloat16)
                 fc_norm = (fc_rounded_sum.to(fx.Float32) * fc_rms * fc_gamma.to(fx.Float32)).to(fx.BFloat16)
                 fc_store_offset = nrm_offset(fc_valid, fc_offset * 2)
-                nrm_st16(fc_od, fc_store_offset, fc_rounded_sum.bitcast(fx.Int32), 3)
+                nrm_st16(fc_od, fc_store_offset, fc_rounded_sum.bitcast(fx.Int32), 17)
                 nrm_st16(fc_nd, fc_store_offset, fc_norm.bitcast(fx.Int32), 3)
                 fc_raw = fc_norm.bitcast(fx.Int32)
                 fc_values = fc_norm.to(fx.Float32)
@@ -3081,7 +3081,7 @@ def build_verify_m8_long(layer_count=64, diagnostics=False):
                 if iteration_block != 0:
                     worker = iteration_block - 136
                 for index in range(worker * 256 + iteration_tid, 40960, 8 * 256):
-                    fx.ptr_store(fx.BFloat16(0.0), mixer + index)
+                    llvm.InlineAsmOp(None, [fx.Uint64(fx.ptrtoint(mixer + index)).ir_value(), fx.Int32(0).ir_value()], 'global_store_short $0, $1, off sc0 sc1', 'v,v,~{memory}', has_side_effects=True)
 
             def fill_up_padding(scales):
                 index = iteration_block * 256 + iteration_tid
